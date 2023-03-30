@@ -1,0 +1,15 @@
+variable id,description,type
+host_response_time,how long does it take for them to respond to a booking request?,numerical
+host_response_rate,how often do they respond to requests?,factor with 4 levels
+host_acceptance_rate,what is their request acceptance rate?,numerical
+host_is_superhost,are they a superhost?,True/false
+host_verifications,how many verifications do they have?,numerical
+host_identity_verified,are they a verified user,True/false
+neighbourhood_cleansed,name of neighbourhood,character
+bedrooms,number of bedrooms,numerical
+price,Nightly price,numerical
+availability_30,How many days out of the next 30 months is it available?,numerical
+number_of_reviews,how many reviews does the unit have?,numerical
+review_scores_rating,review ratings,scale of 1-5
+Instant_bookable,can I book it right away without contacting the host?,True/false
+reviews_per_month,how many reviews does it get per month?,numerical

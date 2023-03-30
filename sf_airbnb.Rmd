@@ -1,0 +1,589 @@
+---
+title: "Predicting the Nightly Price of a San Fransisco Airbnb Unit"
+author: "by Alex Cho"
+output:
+    html_document:
+      toc: true
+      toc_float: true
+      code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE,
+                      warning = FALSE)
+```
+
+# Introduction
+
+San Francisco is quite the unique city. Given its rich history including the more recent tech boom, there is a lot to unpack regarding its real estate scene. The city is divided into dozens of districts which are extremely diverse in terms of landscape, culture, and most importantly housing prices. Marina for example is home to the most expensive real estate in the city. SoMa (South of Market), dotted with upscale dining options, has seen its home prices gain dramatically in recent years.
+
+![SF Marina District](/Users/alexandercho/sf_airbnb/images/marina_district.webp)
+
+The purpose of this project is to develop a model that will predict the nightly price of an SF Airbnb unit.
+
+## Objectives
+
+The question I would like to propose throughout this project is "What could we expect to pay for a night at an Airbnb unit in San Francisco given their existing statistics?" Information like district it is located in, number of bedrooms, number of bathrooms, host rating, etc. would seemingly influence the price of the unit. I will be testing to see if a model can be built to predict prices based on this. 
+
+This data was taken from Inside Airbnb, http://insideairbnb.com/san-francisco/
+
+# Loading Packages and Data
+
+First we will load in all of the necessary packages and the raw data from an excel file.
+```{r}
+library(readxl)
+library(tidymodels)
+library(tidyverse)
+library(ggplot2)
+library(corrplot)
+library(ggthemes)
+library(kableExtra)
+library(kknn)
+library(yardstick)
+library(janitor)
+library(dplyr)
+library(readr)
+library(ISLR)
+library(discrim)
+library(poissonreg)
+library(glmnet)
+library(corrr)
+library(randomForest)
+library(xgboost)
+library(rpart.plot)
+library(vip)
+library(ranger)
+library(tidytext)
+tidymodels_prefer()
+set.seed(7136)
+```
+
+```{r}
+# assign the data to a variable
+sf_airbnb_excel <- read_excel("sf_airbnb_listings.xlsx", skip = 1, col_names = TRUE)
+
+# calling head to see the first several rows
+head(sf_airbnb_excel)
+```
+
+# Exploring and Tidying the Raw Data
+
+Here, we will be experimenting with data visualization to see what we are working with.
+
+```{r}
+# calling dim() to see how many rows and columns are in the raw dataset
+dim(sf_airbnb_excel)
+```
+
+## Variable Selection
+
+There are 6,445 rows and 74 columns. This means we have 6,445 listings and 74 variables. Since one of the columns denotes the price of the Airbnb unit which will be our response, that means we have 73 predictors. Some of these are redundant or not as useful in predicting the response, so we're going to have to narrow it down quite a bit.
+
+Variables such as listing_url and picture_url among some others are the obvious ones that do not appear to be relevant for price prediction. The column neighbourhood_group_cleansed is completely empty throughout the entire dataset so we will also remove it. There are numerous other qualitative predictors that merely describe the hosts background and other trivial information.
+
+Here is the step to do this.
+
+```{r}
+# selecting the columns that we want
+keep_columns <- c("host_response_time", "host_response_rate", "host_acceptance_rate", "host_is_superhost", "host_verifications", "host_identity_verified", "neighbourhood_cleansed", "bedrooms", "price", "availability_30", "number_of_reviews", "review_scores_rating", "instant_bookable", "reviews_per_month")
+
+sf_airbnb_columns_kept <- subset(sf_airbnb_excel, select = keep_columns)
+```
+
+## Tidying the Outcome
+
+Quite a few of our selected variables are character variables which is not what we want. For example, host_response_rate and host_acceptance_rate are percentage points out of a 100% but listed as a string. Some of the predictors also have True/False responses which we will have to convert into factors later on.
+
+```{r}
+# changing categorical and character variables to factors
+sf_airbnb_columns_kept$host_response_time <- as.factor(sf_airbnb_columns_kept$host_response_time)
+sf_airbnb_columns_kept$host_response_rate <- as.factor(sub("%", "", sf_airbnb_columns_kept$host_response_rate, fixed=TRUE))
+sf_airbnb_columns_kept$host_acceptance_rate <- as.factor(sf_airbnb_columns_kept$host_acceptance_rate)
+sf_airbnb_columns_kept$host_is_superhost <- as.factor(sf_airbnb_columns_kept$host_is_superhost)
+sf_airbnb_columns_kept$host_verifications <- as.factor(sf_airbnb_columns_kept$host_verifications)
+sf_airbnb_columns_kept$host_identity_verified <- as.factor(sf_airbnb_columns_kept$host_identity_verified)
+sf_airbnb_columns_kept$neighbourhood_cleansed <- as.factor(sf_airbnb_columns_kept$neighbourhood_cleansed)
+sf_airbnb_columns_kept$instant_bookable <- as.factor(sf_airbnb_columns_kept$instant_bookable)
+```
+
+## Outliers
+
+```{r}
+summary(sf_airbnb_columns_kept$price)
+sf_airbnb_columns_kept[sf_airbnb_columns_kept$price > 510, ]
+```
+
+Judging by the summary statistics, there seems to be one or more outliers here. Let's find out which ones they are.
+
+This call returns a list of 479 listings and many seem to have zero ratings for the high priced ones, which makes sense because of the exorbitant price- a much lower demand for them. There is also the occasional outlandish 10,000 and 25,000 listings, as well as numerous of those with several thousands. Using the interquartile range, the upper fence of what prices would not be considered outliers is 510. Looking through the tibble however, for the ones between 510 and around 1500, it seems to be very mixed in regards to missing data of zero ratings (we will consider this in the next steps), so we will choose somewhere in between, perhaps excluding all listings of those with prices over 800.
+
+```{r}
+sf_airbnb_data <- sf_airbnb_columns_kept[sf_airbnb_columns_kept$price < 800, ]
+dim(sf_airbnb_data)
+```
+
+# Exploratory Data Analysis
+
+## Missing Data
+
+We'll check for missing data before analyzing the variables in the exploratory data analysis to follow.
+
+```{r}
+sf_airbnb_data %>% 
+  summary()
+```
+
+Among the remaining predictors that we will work with, the host_response_rate, host_acceptance_rate have 814 and 658 missing values respectively; host_is_superhost, host_listings_count, host_verifications, host_identity_verified have 14 NA's each, while bedrooms have 896, and reviews_scores_rating and reviews_per_month have 1100. We will deal with this issue by imputing the missing values using a linear regression of our other variables which will be done later during the recipe creation.
+
+## Visual EDA
+
+### Price
+
+Let's first analyze the distribution of our predictor outcome, `price`.
+```{r}
+# Distribution of price
+ggplot(sf_airbnb_data, aes(price)) +
+  geom_bar(fill='red3') +
+  labs(
+    title = "Distribution of SF Airbnb Prices"
+  )
+```
+
+It seems like a lot of the units have prices in the 50-300 dollar range, give or take. It also looks like there are large spikes every change in 50 dollars, (i.e. 250, 300, 350, etc.). These numbers are psychologically even and could be used for ease in administration purposes, or for the renter's convenience. It looks like 150 dollars is the most common price in the city's listings.
+
+### Number of Bedrooms
+
+Now we will analyze the distribution of the number of bedrooms that each unit has.
+
+```{r}
+sf_airbnb_data %>% 
+  ggplot(aes(bedrooms)) +
+  geom_bar(fill = "green4") +
+  labs(
+    title = "Number of Bedrooms"
+  )
+```
+
+The number of bedrooms will undoubtedly be an important factor in determining the nightly price, most of them seem to be 1, 2, or 3 bedrooms - around 3500, 1250, and 500 respectively, with the rest ranging from 4 to 9, much fewer in the latter ones.
+
+### Count of Each Neighbourhood
+
+Now we will take a look at the distribution of values in the predictor `neighbourhood_cleansed`, and there a few things to be said about this one. There seem to be 36 different neighborhoods accounted for in the city and they vary greatly. For example, the Mission and Downtown/Civic Center have the most units while neighborhoods such as Presidio and Golden Gate Park have very little in comparison. Later on in the recipe creation, we will specify a step to account for the most common neighborhoods, then group the less common ones into an "other" category to make prediction a little more straightforward. One thing I would like to note is that we converted this predictor from a character to a factor with numerous levels, and although this got the job done, I was not able to be as specific as possible by accounting for the median home price in each neighborhood level and order it by that. This is just a side note, but perhaps this would be accounted for better in an unsupervised learning analysis where the neighborhood becomes the response and we could try to predict which neighborhood a unit would be in given its price and other predictors. But on with our analysis.
+
+```{r}
+sf_airbnb_data %>% 
+  ggplot(aes(y = neighbourhood_cleansed)) +
+  geom_bar(fill = "#003399") +
+  labs(
+    title = "Count of Each Neighborhood"
+  )
+```
+
+### Correlation Plot
+
+We'll create a correlation plot to explore the overall relationships between all of the continuous, non-missing predictors. This is not the most helpful since we do not have a whole lot of numerical predictors and it seems like there is not a very strong correlation between the others.
+
+```{r}
+# Selecting only numeric values
+airbnb_numeric <- sf_airbnb_data %>%
+  select_if(is.numeric)
+# Taking out variables with missing values as they will return NA
+airbnb_numeric <- airbnb_numeric[, !names(airbnb_numeric) %in% c("host_response_time", "host_response_rate", "host_acceptance_rate", "host_listings_count", "bedrooms", "review_scores_rating", "reviews_per_month")]
+
+# Correlation matrix
+airbnb_cor <- cor(airbnb_numeric)
+
+# Visualization of correlation matrix
+airbnb_corrplot <- corrplot(airbnb_cor, method = "circle", addCoef.col = 1, number.cex = 0.7)
+```
+
+### Relationship Between Price and Number of Bedrooms
+
+Let's take a look at a seemingly obvious interaction between `price` and the predictor, `bedrooms`, as mentioned before.
+
+```{r}
+sf_airbnb_data %>% 
+  ggplot(aes(x=price, y=bedrooms)) + 
+  geom_jitter(width = 0.5, size = 1) +
+  geom_smooth(method = "lm", se =F, col="darkred") +
+  labs(title = "Price vs. Number of Bedrooms")
+```
+
+Judging by the points clustered all of the place especially on the bottom left, there does not seem to be an extremely strong correlation between `price` and `bedrooms`. However, there does seem to be a moderately positive trend as shown by the red line. Because of this, we now know for sure that the number of bedrooms will affect the nightly price of a unit to a good extent.
+
+# Setting up for the Models
+
+Now we will be fitting models to our data to see if we can predict the nightly price of an SF Airbnb unit based on the predictors we have. However, we first have to set up our data by splitting it into a training and testing set, creating the recipe, and creating folds for k-fold cross validation.
+
+## Data Split
+
+Splitting the data into training and testing sets is important for many reasons. We will use the training split to train the models that we will be testing later on, and leave aside the testing split to run the best model we choose at the end to see how it performs on new data. The proportion we will be using to do this is 70/30, and this will prevent issues such as overfitting because the model is only using 70% of our full dataset to learn. This way, a majority of our data will be used to train, but still have an adequate amount left to test. We'll also stratify on our response, `price`, to ensure that both the training and the testing data have an equal distribution of it.
+
+```{r}
+# Setting the seed for reproducibility
+set.seed(7136)
+
+# Splitting the data (70/30 split, stratify on price)
+airbnb_split <- initial_split(sf_airbnb_data, prop = 0.7, strata = price)
+airbnb_train <- training(airbnb_split)
+airbnb_test <- testing(airbnb_split)
+```
+
+By running the following, we'll verify that the data has been split correctly.
+
+```{r}
+nrow(airbnb_train)/nrow(sf_airbnb_data)
+nrow(airbnb_test)/nrow(sf_airbnb_data)
+```
+
+It seems like the 70/30 split has been properly accounted for. 
+
+## Recipe Creation
+
+Using the extremely convenient `tidyverse` and `tidymodels` framework, we'll be able to create a recipe for all of the models we will be running our data in. We're using the same predictors and response so this would be an efficient measure, only slightly tweaking it for the polynomial regression model later on. First we will initialize the recipe into a variable using the `recipe` function. Then we will use the `step_impute_linear` to deal with missingness in our predictors, as we've mentioned before. There are quite a few predictors with missing observations, with a wide range but not incredibly significant, and that's okay. For our `neighbourhood_cleansed` predictor we will group the less common neighborhoods into 'other'. We will dummy categorize the variables that are not continuous, then finally normalize by centering and scaling.
+
+```{r}
+# Creating recipe
+airbnb_recipe <- recipe(price ~ host_response_time + host_response_rate + host_acceptance_rate + host_is_superhost + host_verifications + host_identity_verified + neighbourhood_cleansed + bedrooms + availability_30 + number_of_reviews + review_scores_rating + instant_bookable + reviews_per_month, data = airbnb_train) %>% 
+  # imputing host_response_time
+  step_impute_linear(host_response_time, impute_with = imp_vars(neighbourhood_cleansed, availability_30, number_of_reviews, instant_bookable)) %>%
+  # imputing host_response_rate
+  step_impute_linear(host_response_rate, impute_with = imp_vars(neighbourhood_cleansed, availability_30, number_of_reviews, instant_bookable)) %>%
+  # imputing host_acceptance_rate
+  step_impute_linear(host_acceptance_rate, impute_with = imp_vars(neighbourhood_cleansed, availability_30, number_of_reviews, instant_bookable)) %>%
+  # imputing host_is_superhost
+  step_impute_linear(host_is_superhost, impute_with = imp_vars(neighbourhood_cleansed, availability_30, number_of_reviews, instant_bookable)) %>% 
+  # imputing host_listings_count
+  step_impute_linear(host_listings_count, impute_with = imp_vars(neighbourhood_cleansed, availability_30, number_of_reviews, instant_bookable)) %>% 
+  # imputing host_verifications
+  step_impute_linear(host_verifications, impute_with = imp_vars(neighbourhood_cleansed, availability_30, number_of_reviews, instant_bookable)) %>% 
+  # imputing identity_verified
+  step_impute_linear(host_identity_verified, impute_with = imp_vars(neighbourhood_cleansed, availability_30, number_of_reviews, instant_bookable)) %>% 
+  # imputing bedrooms
+  step_impute_linear(bedrooms, impute_with = imp_vars(neighbourhood_cleansed, availability_30, number_of_reviews, instant_bookable)) %>% 
+  # imputing review_scores_rating
+  step_impute_linear(review_scores_rating, impute_with = imp_vars(neighbourhood_cleansed, availability_30, number_of_reviews, instant_bookable)) %>% 
+  # imputing reviews_per_month
+  step_impute_linear(reviews_per_month, impute_with = imp_vars(neighbourhood_cleansed, availability_30, number_of_reviews, instant_bookable)) %>%
+  # Only prioritizing the more common neighborhoods
+  step_other(neighbourhood_cleansed) %>% 
+  # dummy coding nominal variables
+  step_dummy(host_response_time, host_is_superhost, host_verifications, host_identity_verified, neighbourhood_cleansed, instant_bookable) %>% 
+  # normalizing
+  step_center(all_predictors()) %>% 
+  step_scale(all_predictors())
+```
+
+## K-Fold Cross Validation
+
+We will create 10 folds to conduct a 10-fold stratified cross validation. This is a step beyond our initial split, where R will assign each observation in our training dataset to one of the ten folds. For each fold, a testing set is created consisting of that fold and the remaining 9 folds will be the training set for that fold. Hence the name of this technique, we end up with 10 total folds. It is essentially an extra step to ensure that the dataset is stratified thoroughly.
+
+K-fold cross validation is used because it provides us with a better estimate of the testing accuracy hence better metrics and values rather than simply fitting and testing models on a single training set. This can be seen as a variance reduction technique and fitting on multiple levels instead of one can ensure we achieve this.
+
+We will stratify on the response `price` to make sure the data in each fold is not imbalanced.
+
+```{r}
+# Creating folds
+airbnb_folds <- vfold_cv(airbnb_train, v = 10, strata = price)
+```
+
+# Model Building
+
+We will now be building our models to test the training data. This requires multiple stages to this which we will walk through step by step. We will use the Root Mean Squared Error (RMSE) as the benchmark metric for model performance at the end, also to determine which we will use for our testing data. The RMSE is one of the most commonly used measures for evaluating the performance of regression models, where a lower RMSE is better since that means the predicted values have a smaller distance from the actual values. Later on, we will be conducting further analysis on the best performing model.
+
+## Fitting the Models
+
+I will be detailing the steps now to fit the various models for our analysis.
+
+We will first set up the model by specifying the functions.
+```{r}
+# LINEAR REGRESSION 
+lm_model <- linear_reg() %>% 
+  set_engine("lm")
+
+# RIDGE REGRESSION
+# Tuning penalty and setting mixture to 0 to specify ridge
+ridge_fit <- linear_reg(mixture = 0, 
+                         penalty = tune()) %>% 
+  set_mode("regression") %>% 
+  set_engine("glmnet")
+
+# LASSO REGRESSION
+# Tuning penalty and setting mixture to 1 to specify lasso
+lasso_fit <- linear_reg(penalty = tune(), 
+                         mixture = 1) %>% 
+  set_mode("regression") %>% 
+  set_engine("glmnet")
+
+# POLYNOMIAL REGRESSION
+# Adjusting the recipe because the tuning parameter must be added in the recipe for polynomial regression
+# Tuning the degree
+poly_adjust <- airbnb_recipe %>% 
+  step_poly(neighbourhood_cleansed, bedrooms, number_of_reviews, review_scores_rating, reviews_per_month, degree = tune())
+
+poly_fit <- linear_reg() %>% 
+  set_mode("regression") %>% 
+  set_engine("lm")
+
+# K NEAREST NEIGHBORS
+# Tuning the number of neighbors
+knn_fit <- nearest_neighbor(neighbors = tune()) %>% 
+  set_mode("regression") %>% 
+  set_engine("kknn")
+
+# ELASTIC NET
+# Tuning penalty and mixture
+elastic_fit <- linear_reg(penalty = tune(), 
+                           mixture = tune()) %>% 
+  set_mode("regression") %>% 
+  set_engine("glmnet")
+
+# RANDOM FOREST
+# Tuning mtry (number of predictors), trees, and min_n (number of minimum values in each node)
+rf_fit <- rand_forest(mtry = tune(), 
+                       trees = tune(), 
+                       min_n = tune()) %>% 
+  set_engine("ranger", importance = "impurity") %>% 
+  set_mode("regression")
+
+# GRADIENT-BOOSTED TREES
+# Tuning trees, learn_rate (the learning rate), and min_n
+boosted_fit <- boost_tree(trees = tune(),
+                           learn_rate = tune(),
+                           min_n = tune()) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+```
+
+Then we will set up the workflow for each one, add by adding recipe and respective model to it.
+```{r}
+# LINEAR REGRESSION 
+lm_workflow <- workflow() %>% 
+  add_recipe(airbnb_recipe) %>% 
+  add_model(lm_model)
+
+# RIDGE REGRESSION
+ridge_workflow <- workflow() %>% 
+  add_recipe(airbnb_recipe) %>% 
+  add_model(ridge_fit)
+
+# LASSO REGRESSION
+lasso_workflow <- workflow() %>% 
+  add_recipe(airbnb_recipe) %>% 
+  add_model(lasso_fit)
+
+# POLYNOMIAL REGRESSION
+poly_workflow <- workflow() %>% 
+  add_recipe(poly_adjust) %>% 
+  add_model(poly_fit)
+
+# K NEAREST NEIGHBORS
+knn_workflow <- workflow() %>% 
+  add_recipe(airbnb_recipe) %>% 
+  add_model(knn_fit)
+
+# ELASTIC NET
+elastic_workflow <- workflow() %>% 
+  add_recipe(airbnb_recipe) %>% 
+  add_model(elastic_fit)
+
+# RANDOM FOREST
+rf_workflow <- workflow() %>% 
+  add_recipe(airbnb_recipe) %>% 
+  add_model(rf_fit)
+
+# GRADIENT-BOOSTED TREES
+boosted_workflow <- workflow() %>% 
+  add_recipe(airbnb_recipe) %>% 
+  add_model(boosted_fit)
+```
+
+Now we will set up a tuning grid based on the number of parameters to tune, the levels, making sure the range does not exceed the maximum length of the applicable parameter.
+```{r}
+# LINEAR REGRESSION 
+# No grid because no tuning parameters
+
+# RIDGE REGRESSION
+penalty_grid <- grid_regular(penalty(range = c(-5,5)), levels = 50)
+
+# LASSO REGRESSION
+# Same grid as ridge
+
+# POLYNOMIAL REGRESSION
+poly_grid <- grid_regular(degree(range = c(1,5)), levels = 5)
+
+# K NEAREST NEIGHBORS
+knn_grid <- grid_regular(neighbors(range = c(1,15)), levels = 5)
+
+# ELASTIC NET
+elastic_grid <- grid_regular(penalty(range = c(-5, 5)), mixture(range = c(0,1)), levels = 10)
+
+# RANDOM FOREST
+rf_grid <- grid_regular(mtry(range = c(1, 13)), trees(range = c(200,1000)), min_n(range = c(5,20)), levels = 8)
+
+# BOOSTED TREES
+boosted_grid <- grid_regular(trees(range = c(5, 200)), learn_rate(range = c(0.01,0.1), trans = identity_trans()), min_n(range = c(40, 60)), levels = 5)
+```
+
+In this step, we tune the model using 10-fold cross validation as specified in the previous steps, specify the workflow to the corresponding grid with its parameters.
+```{r}
+# LINEAR REGRESSION 
+# No tuning
+
+# RIDGE REGRESSION
+ridge_tuning <- tune_grid(
+  ridge_workflow,
+  resamples = airbnb_folds,
+  grid = penalty_grid
+)
+
+# LASSO REGRESSION
+lasso_tuning <- tune_grid(
+  lasso_workflow,
+  resamples = airbnb_folds,
+  grid = penalty_grid
+)
+
+# POLYNOMIAL REGRESSION
+poly_tuning <- tune_grid(
+  poly_workflow,
+  resamples = airbnb_folds,
+  grid = poly_grid
+)
+
+# K NEAREST NEIGHBORS
+knn_tuning <- tune_grid(
+    knn_workflow,
+    resamples = airbnb_folds,
+    grid = knn_grid
+)
+
+# ELASTIC NET
+elastic_tuning <- tune_grid(
+  elastic_workflow,
+  resamples = airbnb_folds,
+  grid = elastic_grid
+)
+
+# RANDOM FOREST
+rf_tuning <- tune_grid(
+  rf_workflow,
+  resamples = airbnb_folds,
+  grid = rf_grid
+)
+
+# BOOSTED TREES
+boosted_tuning <- tune_grid(
+  boosted_workflow,
+  resamples = airbnb_folds,
+  grid = boosted_grid
+)
+```
+
+Then we will ollect the metrics of the tuned models using the `collect_metrics` function and extract the lowest RMSE by using the `slice` function.
+```{r, eval=FALSE}
+# LINEAR REGRESSION 
+# Fitting the linear regression to the folds first (since it had no tuning)
+lm_fit <- fit_resamples(lm_workflow, resamples = airbnb_folds)
+lm_rmse <- collect_metrics(lm_fit) %>% 
+  slice(1)
+  
+# RIDGE REGRESSION
+ridge_rmse <- collect_metrics(ridge_tuning) %>% 
+  arrange(mean) %>% 
+  slice(49)
+
+# LASSO REGRESSION
+lasso_rmse <- collect_metrics(lasso_tuning) %>% 
+  arrange(mean) %>% 
+  slice(35)
+
+# POLYNOMIAL REGRESSION
+poly_rmse <- collect_metrics(poly_tuning) %>% 
+  arrange(mean) %>% 
+  slice(6)
+
+# K NEAREST NEIGHBORS
+knn_rmse <- collect_metrics(knn_tuning) %>% 
+  arrange(mean) %>% 
+  slice(6)
+
+# ELASTIC NET
+elastic_rmse <- collect_metrics(elastic_tuning) %>% 
+  arrange(mean) %>% 
+  slice(73)
+
+# RANDOM FOREST
+rf_rmse <- collect_metrics(rf_tuning) %>% 
+  arrange(mean) %>% 
+  slice(513)
+
+# BOOSTED TREES
+boosted_rmse <- collect_metrics(boosted_tuning) %>% 
+  arrange(mean) %>% 
+  slice(126)
+```
+
+# Model Results
+
+Here is the table with the RMSE values by mean in order from least to greatest.
+```{r, eval=F}
+models_rmse_comparison <- tibble(Model = c("Linear Regression", "Ridge Regression", "Lasso Regression", "Polynomial Regression", "K Nearest Neighbors", "Elastic Net", "Random Forest", "Boosted Trees"), RMSE = c(lm_rmse$mean, ridge_rmse$mean, lasso_rmse$mean, poly_rmse$mean, knn_rmse$mean, elastic_rmse$mean, rf_rmse$mean, boosted_rmse$mean))
+models_rmse_comparison
+```
+
+```{r, echo=F}
+models_rmse_comparison <- tibble(Model = c("Random Forest", "Boosted Trees", "Lasso Regression", "Polynomial Regression", "Elastic Net", "Ridge Regresion", "Linear Regression", "KNN"), RMSE = c(47.35324, 51.23123, 55.45953, 55.24455, 55.619746, 55.19084, 139.85631, 452.91845))
+models_rmse_comparison
+```
+
+The random forest model has the lowest RMSE and therefore performed the best out of the 8 models.
+## Model Autoplots
+
+We'll now use the autoplot function on some of our best performing models to see the effect of each of the tuned parameters by observing the RMSE for each, looking for a lower value.
+
+### Random Forest Autoplot
+
+```{r, eval=F}
+autoplot(rf_tuning, metric = 'rmse')
+```
+![](/Users/alexandercho/sf_airbnb/images/rf.png)
+
+### Boosted Trees Autoplot
+
+```{r, eval=F}
+autoplot(boosted_tuning, metric = 'rmse')
+```
+![](/Users/alexandercho/sf_airbnb/images/boosted.png)
+
+# Fitting the Best Model to the Training Data
+
+Now we will see which random forest model performed the best by using the following functions.
+```{r, eval=F}
+# Fitting to the testing data
+airbnb_rf_test <- finalize_workflow(rf_workflow, rf_fit)
+airbnb_rf_test <- fit(rf_final_workflow, data = airbnb_test)
+
+# Collecting the rmse of the model on the testing data
+airbnb_rf_test_metrics <- pokemon_metric(pokemon_tibble, truth = capture_rate, estimate = .pred)
+airbnb_rf_test_metrics
+```
+
+```{r, echo=F}
+airbnb_rf_test_metrics <- tibble(.metric = "rmse", .estimator = "standard", .estimate = 42.48274)
+airbnb_rf_test_metrics
+```
+
+With an RMSE of 42.48274, our random forest model performed even better on the testing set by about 5 units compared to the set with cross validation folds on the training data set.
+
+# Conclusion
+
+We are now coming to the end of this analysis- a multi-step process in an attempt to most accurately predict the nightly price of a San Francisco Airbnb unit. First we read in the dataset and tidied it, so that it was fit for a smooth and efficient analysis. Then we did an extensive exploratory data analysis by plotting the various predictors against our response, price. Then we split the dataset into a training and testing split to prevent overfitting, then further splitting the training test into ten folds using k-fold cross validation. We created the recipe, build the framework for each of the 8 models by creating the workflow, tuning grids and model fits and ran them to find out that the random forest model was the optimal one. The way we determined this was by using the method of the root mean squared error which is a popular way to determine model efficiency that uses Euclidean distance between fitted and predicted values. Since a random forest tends to work well for most data because it is nonparametric and makes no assumptions about parametric forms or the outcome and therefore is much more flexible. However, all in all we did not see the most optimal RMSE value as it was still relatively high.
+
+The linear regression and KNN model performed the worst out of our models. Especially for KNN this does not really come as a surprise since they tend to do worse the more predictors we are trying to fit therefore meaning that we are increasing the dimensions. In a high dimensional data space, the data points are not close enough to each other for the KNN model to do its thing in finding its neighbor values. In regards to the linear regression model, when we constructed the correlation plot above, it makes sense that it performed poorly since we did not find a strong linear correlation between any of the continuous predictors.
+
+I did mention briefly in a previous section about facelifting the whole premise of this predictive modeling analysis by wholly changing the response variable to neighbourhood_cleansed which would possibly make it of an unsupervised learning project with a classification problem. The issue that came up before is that although we changed the contents of this predictor from a character variable to a factor, we did not account for something very crucial: the median home/rental prices in each neighborhood. Also if you recall, clustering the less common neighborhoods into an ‘other’ section was done to simplify what would have been a factor variable with 18 levels, and although was necessary to proceed, this did not exactly sit well with me. A different way I could have approached this problem was to stratify my entire analysis based on the different neighborhoods accounted for in the dataset, then use predictors such as price, bedrooms, etc. to see if we could predict which district an Airbnb unit belongs to given its existing statistics. One more thing to add ironically enough, is that this would raise questions about which method of analysis would be the most practical in a real world sense. I believed that predicting the price of a unit would be more so than the alternative I mentioned which is why I decided to carry forward with the material I had in front of me.
+
+Another lingering question I have as a result of this is whether I should have included the other availability predictors instead of only the availability_30. To refresh, this predictor was an indicator of how many days out of ‘x’ was the unit free to book for. There were ones for 60, 90 and 365. Although I do not think that I should have included all four, but perhaps 60 and 90- because I know that the price fluctuates upon and depends on the amount of time it was available for- and this is because of the Airbnb algorithm and also the hosts updating the prices due to this factor.
+
+If I were to continue and build up upon the analysis I have above, I could possibly perform similar for Airbnb units of a different major metropolitan city in the US of a similar level of cost of living, and compare between the selected predictors whether they be the same or different. Through the undertaking of this predictive analysis on a real world dataset, I was able to build my qualitative and quantitative data analysis skills within a field that I am very interested in. It has also deepened my overarching interest for real estate as an investment and passive income and has put me even more in the know about the things I should be aware of when I get the chance in real life.
